@@ -405,6 +405,25 @@ int ff_rtmp_packet_write(URLContext *h, RTMPPacket *pkt,
     return written;
 }
 
+int ff_rtmp_packet_clone(RTMPPacket *pkt_dst, const RTMPPacket *pkt_src)
+{
+    if (pkt_src->size) {
+        pkt_dst->data = av_realloc(NULL, pkt_src->size);
+        if (!pkt_dst->data)
+            return AVERROR(ENOMEM);
+        else
+            memcpy(pkt_dst->data, pkt_src->data, pkt_src->size);
+    }
+    pkt_dst->size       = pkt_src->size;
+    pkt_dst->channel_id = pkt_src->channel_id;
+    pkt_dst->type       = pkt_src->type;
+    pkt_dst->timestamp  = pkt_src->timestamp;
+    pkt_dst->extra      = pkt_src->extra;
+    pkt_dst->ts_field   = pkt_src->ts_field;
+
+    return 0;
+}
+
 int ff_rtmp_packet_create(RTMPPacket *pkt, int channel_id, RTMPPacketType type,
                           int timestamp, int size)
 {

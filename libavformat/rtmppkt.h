@@ -100,6 +100,15 @@ int ff_rtmp_packet_create(RTMPPacket *pkt, int channel_id, RTMPPacketType type,
                           int timestamp, int size);
 
 /**
+ * Clone RTMP packet
+ *
+ * @param pkt_dst packet destination
+ * @param pkt_src packet source
+ * @return zero on success, negative value otherwise
+ */
+int ff_rtmp_packet_clone(RTMPPacket *pkt_dst, const RTMPPacket *pkt_src);
+
+/**
  * Free RTMP packet.
  *
  * @param pkt packet

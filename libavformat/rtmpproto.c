@@ -129,6 +129,13 @@ typedef struct RTMPContext {
     char          auth_params[500];
     int           do_reconnect;
     int           auth_tried;
+    int           do_reconnect_on_idr;
+    int           done_reconnect_on_idr; //TODO: Remove
+    AVDictionary* original_opts;
+    char          original_uri[TCURL_MAX_LENGTH];
+    int           original_flags;
+    RTMPPacket    last_avc_seq_header_pkt;    ///< rtmp packet, used to save last AVC video header, used on reconnection
+    RTMPPacket    last_aac_seq_header_pkt;    ///< rtmp packet, used to save last AAC audio header, used on reconnection
 } RTMPContext;
 
 #define PLAYER_KEY_OPEN_PART_LEN 30   ///< length of partial key used for first client digest signing
@@ -2513,6 +2520,12 @@ static int rtmp_close(URLContext *h)
     free_tracked_methods(rt);
     av_freep(&rt->flv_data);
     ffurl_closep(&rt->stream);
+    if (rt->last_avc_seq_header_pkt.size)
+        ff_rtmp_packet_destroy(&rt->last_avc_seq_header_pkt);
+
+    if (rt->last_aac_seq_header_pkt.size)
+        ff_rtmp_packet_destroy(&rt->last_aac_seq_header_pkt);
+
     return ret;
 }
 
@@ -2871,14 +2884,25 @@ reconnect:
                 goto fail;
         }
     } else {
-        rt->flv_size = 0;
-        rt->flv_data = NULL;
-        rt->flv_off  = 0;
-        rt->skip_bytes = 13;
+        if (rt->do_reconnect_on_idr <= 0) {
+            rt->flv_size = 0;
+            rt->flv_data = NULL;
+            rt->flv_off  = 0;
+            rt->skip_bytes = 13;
+
+            rt->last_avc_seq_header_pkt.size = 0;
+            rt->last_aac_seq_header_pkt.size = 0;
+        }
     }
 
     s->max_packet_size = rt->stream->max_packet_size;
     s->is_streamed     = 1;
+
+    // Copy original params
+    av_dict_copy(&rt->original_opts, *opts, 0);
+    rt->original_flags = flags;
+    av_strlcpy(rt->original_uri, uri, TCURL_MAX_LENGTH);
+
     return 0;
 
 fail:
@@ -2951,6 +2975,76 @@ static int rtmp_pause(URLContext *s, int pause)
     return 0;
 }
 
+static int rtmp_reconnect(URLContext *s) {
+    RTMPContext *rt = s->priv_data;
+    int i;
+
+    // Close current RTMP connection
+    av_log(s, AV_LOG_INFO, "JOC REOPENING CONNECTION\n");
+
+    ffurl_closep(&rt->stream);
+    rt->do_reconnect = 0;
+    rt->nb_invokes   = 0;
+    for (i = 0; i < 2; i++)
+        memset(rt->prev_pkt[i], 0, sizeof(**rt->prev_pkt) * rt->nb_prev_pkt[i]);
+
+    free_tracked_methods(rt);
+
+    // Connect RTMP again using orignal values
+    return rtmp_open(s, rt->original_uri, rt->original_flags, &rt->original_opts);
+}
+
+static int rtmp_packet_is_aac_audio_header(RTMPPacket *pkt) {
+    uint8_t sound_format;
+    uint8_t aac_packet_type;
+
+    if ((!pkt) || (pkt->size < 2) || pkt->type != RTMP_PT_AUDIO)
+        return 0;
+
+    sound_format = (pkt->data[0] & 0xF0) >> 4;
+    aac_packet_type = pkt->data[1];
+    // Check codec == AVC and avc contains seq header
+    if (sound_format == 10 && aac_packet_type == 0) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int rtmp_packet_is_avc_video_header(RTMPPacket *pkt) {
+    uint8_t codec_id;
+    uint8_t avc_packet_type;
+
+    if ((!pkt) || (pkt->size < 2) || pkt->type != RTMP_PT_VIDEO)
+        return 0;
+
+    codec_id = pkt->data[0] & 0xF;
+    avc_packet_type = pkt->data[1];
+    // Check codec == AVC and avc contains seq header
+    if (codec_id == 7 && avc_packet_type == 0) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int rtmp_packet_is_video_avc_IDR(RTMPPacket *pkt) {
+    uint8_t frame_type;
+    uint8_t codec_id;
+
+    if ((!pkt) || (pkt->size < 1) || pkt->type != RTMP_PT_VIDEO)
+        return 0;
+
+    frame_type = (pkt->data[0] & 0xF0) >> 4;
+    codec_id = pkt->data[0] & 0xF;
+    // Check codec == AVC and videoFrame == Keyframe / seekable, assuming is IDR
+    if (codec_id == 7 && frame_type == 1) {
+        return 1;
+    }
+
+    return 0;
+}
+
 static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
 {
     RTMPContext *rt = s->priv_data;
@@ -2960,6 +3054,8 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
     const uint8_t *buf_temp = buf;
     uint8_t c;
     int ret;
+    int is_reconnection = 0;
+    int is_idr = 0;
 
     do {
         if (rt->skip_bytes) {
@@ -3012,6 +3108,12 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
             rt->flv_data = rt->out_pkt.data;
         }
 
+        //TODO: JOC send video & audio headers again
+
+        if (ts > 15000 && !rt->done_reconnect_on_idr) {
+            rt->do_reconnect_on_idr++;
+        }
+
         copy = FFMIN(rt->flv_size - rt->flv_off, size_temp);
         bytestream_get_buffer(&buf_temp, rt->flv_data + rt->flv_off, copy);
         rt->flv_off += copy;
@@ -3047,6 +3149,79 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
                 }
             }
 
+            // Save last video header
+            if (rtmp_packet_is_avc_video_header(&rt->out_pkt)) {
+                if (!rt->last_avc_seq_header_pkt.size) {
+                    av_log(s, AV_LOG_INFO, "JOC destroying last video header packet saved\n");
+
+                    // Destroy
+                    ff_rtmp_packet_destroy(&rt->last_avc_seq_header_pkt);
+                }
+                // Save AVC seq header packet
+                if ((ret = ff_rtmp_packet_clone(&rt->last_avc_seq_header_pkt, &rt->out_pkt)) < 0) {
+                    return ret;
+                }
+
+                av_log(s, AV_LOG_INFO, "JOC saved video header packet\n");
+            }
+
+            // Save last audio header
+            if (rtmp_packet_is_aac_audio_header(&rt->out_pkt)) {
+                if (!rt->last_aac_seq_header_pkt.size) {
+                    av_log(s, AV_LOG_INFO, "JOC destroying last audio header packet saved\n");
+
+                    // Destroy
+                    ff_rtmp_packet_destroy(&rt->last_aac_seq_header_pkt);
+                }
+                // Save AAC seq header packet
+                if ((ret = ff_rtmp_packet_clone(&rt->last_aac_seq_header_pkt, &rt->out_pkt)) < 0) {
+                    return ret;
+                }
+
+                av_log(s, AV_LOG_INFO, "JOC saved audio header packet\n");
+            }
+
+            // Check if packet is video IDR
+            is_idr = rtmp_packet_is_video_avc_IDR(&rt->out_pkt);
+            if (is_idr)
+                av_log(s, AV_LOG_INFO, "JOC is AVC IDR\n");
+
+            //TODO: Only reconnect if:
+            // Is IDR
+            // state == PUBLISHING
+            // Video header is saved (if video present)
+            // Audio header is saved (if Audio present)
+            // (optiona) Metadata is saved
+
+            if (rt->do_reconnect_on_idr >= 1 && !rt->done_reconnect_on_idr && is_idr && rt->state == STATE_PUBLISHING && rt->last_avc_seq_header_pkt.size && rt->last_aac_seq_header_pkt.size) {
+                av_log(s, AV_LOG_INFO, "JOC PRE RECONNECT rt->flv_off: %d, rt->flv_size: %d\n", rt->flv_off, rt->flv_size);
+
+                if ((ret = rtmp_reconnect(s)) < 0)
+                    return ret;
+
+                is_reconnection = 1;
+                rt->done_reconnect_on_idr = 1;
+
+                av_log(s, AV_LOG_INFO, "JOC POST RECONNECT rt->flv_off: %d, rt->flv_size: %d\n", rt->flv_off, rt->flv_size);
+            }
+
+            if (is_reconnection) {
+                is_reconnection = 0;
+                // Send last video header
+                av_log(s, AV_LOG_INFO, "JOC SENDING last video header\n");
+                rt->last_avc_seq_header_pkt.timestamp = rt->out_pkt.timestamp;
+                if ((ret = rtmp_send_packet(rt, &rt->last_avc_seq_header_pkt, 0)) < 0)
+                    return ret;
+
+                av_log(s, AV_LOG_INFO, "JOC SENDING last audio header\n");
+                rt->last_aac_seq_header_pkt.timestamp = rt->out_pkt.timestamp;
+                if ((ret = rtmp_send_packet(rt, &rt->last_aac_seq_header_pkt, 0)) < 0)
+                    return ret;
+            }
+
+            av_log(s, AV_LOG_INFO, "JOC SENDING rtmp_send_packet, type: %d, size: %d, ts: %d\n", rt->out_pkt.type, rt->out_pkt.size, rt->out_pkt.timestamp);
+
+            // Send actual packet
             if ((ret = rtmp_send_packet(rt, &rt->out_pkt, 0)) < 0)
                 return ret;
             rt->flv_size = 0;
