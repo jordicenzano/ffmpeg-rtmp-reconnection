@@ -2889,9 +2889,6 @@ reconnect:
             rt->flv_data = NULL;
             rt->flv_off  = 0;
             rt->skip_bytes = 13;
-
-            rt->last_avc_seq_header_pkt.size = 0;
-            rt->last_aac_seq_header_pkt.size = 0;
         }
     }
 
@@ -2975,6 +2972,9 @@ static int rtmp_pause(URLContext *s, int pause)
     return 0;
 }
 
+/**
+ * Reconnect RTMP connection.
+*/
 static int rtmp_reconnect(URLContext *s) {
     RTMPContext *rt = s->priv_data;
     int i;
@@ -2994,6 +2994,9 @@ static int rtmp_reconnect(URLContext *s) {
     return rtmp_open(s, rt->original_uri, rt->original_flags, &rt->original_opts);
 }
 
+/**
+ * Checks RTMP packet and return 1 when it contains an AAC header
+*/
 static int rtmp_packet_is_aac_audio_header(RTMPPacket *pkt) {
     uint8_t sound_format;
     uint8_t aac_packet_type;
@@ -3004,13 +3007,15 @@ static int rtmp_packet_is_aac_audio_header(RTMPPacket *pkt) {
     sound_format = (pkt->data[0] & 0xF0) >> 4;
     aac_packet_type = pkt->data[1];
     // Check codec == AVC and avc contains seq header
-    if (sound_format == 10 && aac_packet_type == 0) {
+    if (sound_format == 10 && aac_packet_type == 0)
         return 1;
-    }
 
     return 0;
 }
 
+/**
+ * Checks RTMP packet and return 1 when it contains an AVC header
+*/
 static int rtmp_packet_is_avc_video_header(RTMPPacket *pkt) {
     uint8_t codec_id;
     uint8_t avc_packet_type;
@@ -3021,13 +3026,15 @@ static int rtmp_packet_is_avc_video_header(RTMPPacket *pkt) {
     codec_id = pkt->data[0] & 0xF;
     avc_packet_type = pkt->data[1];
     // Check codec == AVC and avc contains seq header
-    if (codec_id == 7 && avc_packet_type == 0) {
+    if (codec_id == 7 && avc_packet_type == 0)
         return 1;
-    }
 
     return 0;
 }
 
+/**
+ * Checks RTMP packet and return 1 when it contains video IDR point
+*/
 static int rtmp_packet_is_video_avc_IDR(RTMPPacket *pkt) {
     uint8_t frame_type;
     uint8_t codec_id;
@@ -3037,10 +3044,9 @@ static int rtmp_packet_is_video_avc_IDR(RTMPPacket *pkt) {
 
     frame_type = (pkt->data[0] & 0xF0) >> 4;
     codec_id = pkt->data[0] & 0xF;
-    // Check codec == AVC and videoFrame == Keyframe / seekable, assuming is IDR
-    if (codec_id == 7 && frame_type == 1) {
+    // Check codec == AVC and videoFrame == Keyframe / seekable (assuming that means IDR)
+    if (codec_id == 7 && frame_type == 1)
         return 1;
-    }
 
     return 0;
 }
@@ -3054,7 +3060,7 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
     const uint8_t *buf_temp = buf;
     uint8_t c;
     int ret;
-    int is_reconnection = 0;
+    int execute_reconnection = 0;
     int is_idr = 0;
 
     do {
@@ -3084,8 +3090,13 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
             bytestream_get_be24(&header);
             rt->flv_size = pktsize;
 
-            if (pkttype == RTMP_PT_VIDEO)
+            if (pkttype == RTMP_PT_VIDEO) {
                 channel = RTMP_VIDEO_CHANNEL;
+                rt->has_video = 1;
+            }
+            if (pkttype == RTMP_PT_AUDIO) {
+                rt->has_audio = 1;
+            }
 
             if (((pkttype == RTMP_PT_VIDEO || pkttype == RTMP_PT_AUDIO) && ts == 0) ||
                 pkttype == RTMP_PT_NOTIFY) {
@@ -3106,12 +3117,6 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
 
             rt->out_pkt.extra = rt->stream_id;
             rt->flv_data = rt->out_pkt.data;
-        }
-
-        //TODO: JOC send video & audio headers again
-
-        if (ts > 15000 && !rt->done_reconnect_on_idr) {
-            rt->do_reconnect_on_idr++;
         }
 
         copy = FFMIN(rt->flv_size - rt->flv_off, size_temp);
@@ -3149,9 +3154,14 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
                 }
             }
 
+            //TODO: Set the reconnection, we need to remove
+            if (rt->out_pkt.timestamp > 15000 && !rt->done_reconnect_on_idr) {
+                rt->do_reconnect_on_idr++;
+            }
+
             // Save last video header
             if (rtmp_packet_is_avc_video_header(&rt->out_pkt)) {
-                if (!rt->last_avc_seq_header_pkt.size) {
+                if (rt->last_avc_seq_header_pkt.size) {
                     av_log(s, AV_LOG_INFO, "JOC destroying last video header packet saved\n");
 
                     // Destroy
@@ -3167,7 +3177,7 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
 
             // Save last audio header
             if (rtmp_packet_is_aac_audio_header(&rt->out_pkt)) {
-                if (!rt->last_aac_seq_header_pkt.size) {
+                if (rt->last_aac_seq_header_pkt.size) {
                     av_log(s, AV_LOG_INFO, "JOC destroying last audio header packet saved\n");
 
                     // Destroy
@@ -3181,45 +3191,58 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
                 av_log(s, AV_LOG_INFO, "JOC saved audio header packet\n");
             }
 
-            // Check if packet is video IDR
-            is_idr = rtmp_packet_is_video_avc_IDR(&rt->out_pkt);
-            if (is_idr)
-                av_log(s, AV_LOG_INFO, "JOC is AVC IDR\n");
+            // TODO: (optional) save and resend the Metadata
+            // Reconnection has been requested
+            if (rt->do_reconnect_on_idr >= 1 && !rt->done_reconnect_on_idr && rt->state == STATE_PUBLISHING) {
+                // Check if packet is video IDR
+                is_idr = rtmp_packet_is_video_avc_IDR(&rt->out_pkt);
+                if (is_idr)
+                    av_log(s, AV_LOG_INFO, "JOC is AVC IDR. rt->has_video: %d, rt->has_audio: %d\n", rt->has_video, rt->has_audio);
 
-            //TODO: Only reconnect if:
-            // Is IDR
-            // state == PUBLISHING
-            // Video header is saved (if video present)
-            // Audio header is saved (if Audio present)
-            // (optiona) Metadata is saved
+                if (rt->has_video && rt->has_audio) {
+                    // If we only video let's do the reconnection in an IDR frame when we have both headers saved
+                    if (is_idr && rt->last_avc_seq_header_pkt.size && rt->last_aac_seq_header_pkt.size)
+                        execute_reconnection = 1;
+                }
+                else if (rt->has_video && !rt->has_audio) {
+                    // If we have video and NO audio let's do the reconnection in an IDR frame when we have video header saved
+                    if (is_idr && rt->last_avc_seq_header_pkt.size)
+                        execute_reconnection = 1;
+                }
+                else if (!rt->has_video && rt->has_audio) {
+                    // If we have only audio let's do the reconnection when we have the audio header saved
+                    if (rt->last_aac_seq_header_pkt.size)
+                        execute_reconnection = 1;
+                }
+            }
 
-            if (rt->do_reconnect_on_idr >= 1 && !rt->done_reconnect_on_idr && is_idr && rt->state == STATE_PUBLISHING && rt->last_avc_seq_header_pkt.size && rt->last_aac_seq_header_pkt.size) {
+            if (execute_reconnection) {
+                execute_reconnection = 0;
+
                 av_log(s, AV_LOG_INFO, "JOC PRE RECONNECT rt->flv_off: %d, rt->flv_size: %d\n", rt->flv_off, rt->flv_size);
 
                 if ((ret = rtmp_reconnect(s)) < 0)
                     return ret;
 
-                is_reconnection = 1;
                 rt->done_reconnect_on_idr = 1;
 
                 av_log(s, AV_LOG_INFO, "JOC POST RECONNECT rt->flv_off: %d, rt->flv_size: %d\n", rt->flv_off, rt->flv_size);
-            }
 
-            if (is_reconnection) {
-                is_reconnection = 0;
                 // Send last video header
                 av_log(s, AV_LOG_INFO, "JOC SENDING last video header\n");
                 rt->last_avc_seq_header_pkt.timestamp = rt->out_pkt.timestamp;
                 if ((ret = rtmp_send_packet(rt, &rt->last_avc_seq_header_pkt, 0)) < 0)
                     return ret;
 
+                // Send last audio header
                 av_log(s, AV_LOG_INFO, "JOC SENDING last audio header\n");
                 rt->last_aac_seq_header_pkt.timestamp = rt->out_pkt.timestamp;
                 if ((ret = rtmp_send_packet(rt, &rt->last_aac_seq_header_pkt, 0)) < 0)
                     return ret;
             }
 
-            av_log(s, AV_LOG_INFO, "JOC SENDING rtmp_send_packet, type: %d, size: %d, ts: %d\n", rt->out_pkt.type, rt->out_pkt.size, rt->out_pkt.timestamp);
+            // TODO: Verbose
+            // av_log(s, AV_LOG_INFO, "JOC SENDING rtmp_send_packet, type: %d, size: %d, ts: %d\n", rt->out_pkt.type, rt->out_pkt.size, rt->out_pkt.timestamp);
 
             // Send actual packet
             if ((ret = rtmp_send_packet(rt, &rt->out_pkt, 0)) < 0)
