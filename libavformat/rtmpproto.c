@@ -136,6 +136,7 @@ typedef struct RTMPContext {
     int           original_flags;
     RTMPPacket    last_avc_seq_header_pkt;    ///< rtmp packet, used to save last AVC video header, used on reconnection
     RTMPPacket    last_aac_seq_header_pkt;    ///< rtmp packet, used to save last AAC audio header, used on reconnection
+    RTMPPacket    last_metadata_pkt;        ///< rtmp packet, used to save last onMetadata info, used on reconnection
 } RTMPContext;
 
 #define PLAYER_KEY_OPEN_PART_LEN 30   ///< length of partial key used for first client digest signing
@@ -2526,6 +2527,9 @@ static int rtmp_close(URLContext *h)
     if (rt->last_aac_seq_header_pkt.size)
         ff_rtmp_packet_destroy(&rt->last_aac_seq_header_pkt);
 
+    if (rt->last_metadata_pkt.size)
+        ff_rtmp_packet_destroy(&rt->last_metadata_pkt);
+
     return ret;
 }
 
@@ -3051,6 +3055,28 @@ static int rtmp_packet_is_video_avc_IDR(RTMPPacket *pkt) {
     return 0;
 }
 
+/**
+ * Checks RTMP packet and return 1 when it contains onMetadata info
+*/
+static int rtmp_packet_is_onMetadata_packet(RTMPPacket *pkt) {
+    uint8_t commandbuffer[64];
+    int stringlen;
+    GetByteContext gbc;
+
+    if ((!pkt) || (pkt->size < 10) || pkt->type != RTMP_PT_NOTIFY)
+        return 0;
+
+    bytestream2_init(&gbc, pkt->data, pkt->size);
+    if (ff_amf_read_string(&gbc, commandbuffer, sizeof(commandbuffer),&stringlen))
+        return 0;
+
+    // onMetadata is prepended by "@setDataFrame"
+    if (!strcmp(commandbuffer, "@setDataFrame"))
+        return 1;
+
+    return 0;
+}
+
 static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
 {
     RTMPContext *rt = s->priv_data;
@@ -3159,8 +3185,8 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
                 rt->do_reconnect_on_idr++;
             }
 
-            // Save last video header
             if (rtmp_packet_is_avc_video_header(&rt->out_pkt)) {
+                // Save last video header
                 if (rt->last_avc_seq_header_pkt.size) {
                     av_log(s, AV_LOG_INFO, "JOC destroying last video header packet saved\n");
 
@@ -3171,12 +3197,10 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
                 if ((ret = ff_rtmp_packet_clone(&rt->last_avc_seq_header_pkt, &rt->out_pkt)) < 0) {
                     return ret;
                 }
-
                 av_log(s, AV_LOG_INFO, "JOC saved video header packet\n");
             }
-
-            // Save last audio header
-            if (rtmp_packet_is_aac_audio_header(&rt->out_pkt)) {
+            else if (rtmp_packet_is_aac_audio_header(&rt->out_pkt)) {
+                // Save last audio header
                 if (rt->last_aac_seq_header_pkt.size) {
                     av_log(s, AV_LOG_INFO, "JOC destroying last audio header packet saved\n");
 
@@ -3187,17 +3211,29 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
                 if ((ret = ff_rtmp_packet_clone(&rt->last_aac_seq_header_pkt, &rt->out_pkt)) < 0) {
                     return ret;
                 }
-
                 av_log(s, AV_LOG_INFO, "JOC saved audio header packet\n");
+            } 
+            else if (rtmp_packet_is_onMetadata_packet(&rt->out_pkt)) {
+                // Save last onMetadata packet
+                if (rt->last_metadata_pkt.size) {
+                    av_log(s, AV_LOG_INFO, "JOC destroying last onMetadata packet saved\n");
+
+                    // Destroy
+                    ff_rtmp_packet_destroy(&rt->last_metadata_pkt);
+                }
+                // Save onMetadata packet
+                if ((ret = ff_rtmp_packet_clone(&rt->last_metadata_pkt, &rt->out_pkt)) < 0) {
+                    return ret;
+                }
+                av_log(s, AV_LOG_INFO, "JOC saved onMetadata packet\n");
             }
 
-            // TODO: (optional) save and resend the Metadata
             // Reconnection has been requested
             if (rt->do_reconnect_on_idr >= 1 && !rt->done_reconnect_on_idr && rt->state == STATE_PUBLISHING) {
                 // Check if packet is video IDR
                 is_idr = rtmp_packet_is_video_avc_IDR(&rt->out_pkt);
                 if (is_idr)
-                    av_log(s, AV_LOG_INFO, "JOC is AVC IDR. rt->has_video: %d, rt->has_audio: %d\n", rt->has_video, rt->has_audio);
+                    av_log(s, AV_LOG_INFO, "JOC is AVC IDR. has_video: %d, has_audio: %d\n", rt->has_video, rt->has_audio);
 
                 if (rt->has_video && rt->has_audio) {
                     // If we only video let's do the reconnection in an IDR frame when we have both headers saved
@@ -3214,6 +3250,9 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
                     if (rt->last_aac_seq_header_pkt.size)
                         execute_reconnection = 1;
                 }
+                else {
+                    av_log(s, AV_LOG_WARNING, "JOC reconnection is requested but can NOT be executed. rt->state: %d, has_video: %d, has_audio: %d, is_idr: %d\n", rt->state, rt->has_video, rt->has_audio, is_idr);
+                }
             }
 
             if (execute_reconnection) {
@@ -3228,17 +3267,29 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
 
                 av_log(s, AV_LOG_INFO, "JOC POST RECONNECT rt->flv_off: %d, rt->flv_size: %d\n", rt->flv_off, rt->flv_size);
 
-                // Send last video header
-                av_log(s, AV_LOG_INFO, "JOC SENDING last video header\n");
-                rt->last_avc_seq_header_pkt.timestamp = rt->out_pkt.timestamp;
-                if ((ret = rtmp_send_packet(rt, &rt->last_avc_seq_header_pkt, 0)) < 0)
-                    return ret;
+                // Send last video header if it is saved
+                if (rt->last_avc_seq_header_pkt.size) {
+                    av_log(s, AV_LOG_INFO, "JOC SENDING last video header\n");
+                    rt->last_avc_seq_header_pkt.timestamp = rt->out_pkt.timestamp;
+                    if ((ret = rtmp_send_packet(rt, &rt->last_avc_seq_header_pkt, 0)) < 0)
+                        return ret;
+                }
+                
+                // Send last audio header if it is saved
+                if (rt->last_aac_seq_header_pkt.size) {
+                    av_log(s, AV_LOG_INFO, "JOC SENDING last audio header\n");
+                    rt->last_aac_seq_header_pkt.timestamp = rt->out_pkt.timestamp;
+                    if ((ret = rtmp_send_packet(rt, &rt->last_aac_seq_header_pkt, 0)) < 0)
+                        return ret;
+                }
 
-                // Send last audio header
-                av_log(s, AV_LOG_INFO, "JOC SENDING last audio header\n");
-                rt->last_aac_seq_header_pkt.timestamp = rt->out_pkt.timestamp;
-                if ((ret = rtmp_send_packet(rt, &rt->last_aac_seq_header_pkt, 0)) < 0)
-                    return ret;
+                // Send last onMetadata packet, optional
+                if (rt->last_metadata_pkt.size) {
+                    av_log(s, AV_LOG_INFO, "JOC SENDING last onMetadata header\n");
+                    rt->last_metadata_pkt.timestamp = rt->out_pkt.timestamp;
+                    if ((ret = rtmp_send_packet(rt, &rt->last_metadata_pkt, 0)) < 0)
+                        return ret;
+                }
             }
 
             // TODO: Verbose
