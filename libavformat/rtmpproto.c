@@ -132,6 +132,7 @@ typedef struct RTMPContext {
     uint32_t      last_reconnect_timestamp;
     int           auth_tried;
     int           force_reconnection_now;
+    int           go_away_received;
     AVDictionary* original_opts;
     char          original_uri[TCURL_MAX_LENGTH];
     int           original_flags;
@@ -2164,6 +2165,16 @@ static int handle_invoke_status(URLContext *s, RTMPPacket *pkt)
     return 0;
 }
 
+static int handle_go_away(URLContext *s, RTMPPacket *pkt) {
+    RTMPContext *rt = s->priv_data;
+    
+    av_log(s, AV_LOG_DEBUG, "JOC go away signal received");
+
+    rt->go_away_received = 1;
+
+    return 0;
+}
+
 static int handle_invoke(URLContext *s, RTMPPacket *pkt)
 {
     RTMPContext *rt = s->priv_data;
@@ -2340,6 +2351,10 @@ static int rtmp_parse_result(URLContext *s, RTMPContext *rt, RTMPPacket *pkt)
         break;
     case RTMP_PT_INVOKE:
         if ((ret = handle_invoke(s, pkt)) < 0)
+            return ret;
+        break;
+    case RTMP_PT_GO_AWAY:
+        if ((ret = handle_go_away(s, pkt)) < 0)
             return ret;
         break;
     case RTMP_PT_VIDEO:
@@ -3189,6 +3204,13 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
             if ((rt->reconnect_interval > 0) && (rt->out_pkt.timestamp >= (rt->last_reconnect_timestamp + rt->reconnect_interval * 1000))) {
                 rt->last_reconnect_timestamp = rt->out_pkt.timestamp;
                 rt->force_reconnection_now = 1;
+                av_log(s, AV_LOG_DEBUG, "JOC processing interval reconnection\n");
+            }
+            // Per go away signal
+            if (rt->go_away_received > 0) {
+                rt->go_away_received = 0;
+                rt->force_reconnection_now = 1;
+                av_log(s, AV_LOG_DEBUG, "JOC processing go away signal\n");
             }
 
             if (rtmp_packet_is_avc_video_header(&rt->out_pkt)) {

@@ -59,6 +59,7 @@ typedef enum RTMPPacketType {
     RTMP_PT_SHARED_OBJ,         ///< shared object
     RTMP_PT_INVOKE,             ///< invoke some stream action
     RTMP_PT_METADATA     = 22,  ///< FLV metadata
+    RTMP_PT_GO_AWAY      = 32,  ///< Indicates please reconnect ASAP, server is about to go down
 } RTMPPacketType;
 
 /**

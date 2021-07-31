@@ -28,8 +28,6 @@ elif [[ "$OSTYPE" == "darwin"* ]]; then
     FONT_PATH='/Library/Fonts/Arial.ttf'
 fi
 
-RTMP_RECONNECT_INTERVAL="-rtmp_pageurl hello"
-
 # Start test signal
 ./ffmpeg -hide_banner -y \
 -f lavfi -re -i smptebars=size=1280x720:rate=30 \
