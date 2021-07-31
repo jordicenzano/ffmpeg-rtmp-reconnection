@@ -124,13 +124,14 @@ typedef struct RTMPContext {
     int           nb_streamid;                ///< The next stream id to return on createStream calls
     double        duration;                   ///< Duration of the stream in seconds as returned by the server (only valid if non-zero)
     int           tcp_nodelay;                ///< Use TCP_NODELAY to disable Nagle's algorithm if set to 1
+    int           reconnect_interval;         ///< Forces a reconnected every Xs (in media time)
     char          username[50];
     char          password[50];
     char          auth_params[500];
     int           do_reconnect;
+    uint32_t      last_reconnect_timestamp;
     int           auth_tried;
-    int           do_reconnect_on_idr;
-    int           done_reconnect_on_idr; //TODO: Remove
+    int           force_reconnection_now;
     AVDictionary* original_opts;
     char          original_uri[TCURL_MAX_LENGTH];
     int           original_flags;
@@ -232,7 +233,7 @@ static void free_tracked_methods(RTMPContext *rt)
     rt->nb_tracked_methods   = 0;
 }
 
-static int rtmp_send_packet(RTMPContext *rt, RTMPPacket *pkt, int track)
+static int rtmp_send_packet(RTMPContext *rt, RTMPPacket *pkt, int track, int destroy)
 {
     int ret;
 
@@ -256,7 +257,9 @@ static int rtmp_send_packet(RTMPContext *rt, RTMPPacket *pkt, int track)
     ret = ff_rtmp_packet_write(rt->stream, pkt, rt->out_chunk_size,
                                &rt->prev_pkt[1], &rt->nb_prev_pkt[1]);
 fail:
-    ff_rtmp_packet_destroy(pkt);
+    if (destroy)
+        ff_rtmp_packet_destroy(pkt);
+
     return ret;
 }
 
@@ -408,7 +411,7 @@ static int gen_connect(URLContext *s, RTMPContext *rt)
 
     pkt.size = p - pkt.data;
 
-    return rtmp_send_packet(rt, &pkt, 1);
+    return rtmp_send_packet(rt, &pkt, 1, 1);
 }
 
 
@@ -619,7 +622,7 @@ static int gen_release_stream(URLContext *s, RTMPContext *rt)
     ff_amf_write_null(&p);
     ff_amf_write_string(&p, rt->playpath);
 
-    return rtmp_send_packet(rt, &pkt, 1);
+    return rtmp_send_packet(rt, &pkt, 1, 1);
 }
 
 /**
@@ -643,7 +646,7 @@ static int gen_fcpublish_stream(URLContext *s, RTMPContext *rt)
     ff_amf_write_null(&p);
     ff_amf_write_string(&p, rt->playpath);
 
-    return rtmp_send_packet(rt, &pkt, 1);
+    return rtmp_send_packet(rt, &pkt, 1, 1);
 }
 
 /**
@@ -667,7 +670,7 @@ static int gen_fcunpublish_stream(URLContext *s, RTMPContext *rt)
     ff_amf_write_null(&p);
     ff_amf_write_string(&p, rt->playpath);
 
-    return rtmp_send_packet(rt, &pkt, 0);
+    return rtmp_send_packet(rt, &pkt, 0, 1);
 }
 
 /**
@@ -691,7 +694,7 @@ static int gen_create_stream(URLContext *s, RTMPContext *rt)
     ff_amf_write_number(&p, ++rt->nb_invokes);
     ff_amf_write_null(&p);
 
-    return rtmp_send_packet(rt, &pkt, 1);
+    return rtmp_send_packet(rt, &pkt, 1, 1);
 }
 
 
@@ -717,7 +720,7 @@ static int gen_delete_stream(URLContext *s, RTMPContext *rt)
     ff_amf_write_null(&p);
     ff_amf_write_number(&p, rt->stream_id);
 
-    return rtmp_send_packet(rt, &pkt, 0);
+    return rtmp_send_packet(rt, &pkt, 0, 1);
 }
 
 /**
@@ -741,7 +744,7 @@ static int gen_get_stream_length(URLContext *s, RTMPContext *rt)
     ff_amf_write_null(&p);
     ff_amf_write_string(&p, rt->playpath);
 
-    return rtmp_send_packet(rt, &pkt, 1);
+    return rtmp_send_packet(rt, &pkt, 1, 1);
 }
 
 /**
@@ -762,7 +765,7 @@ static int gen_buffer_time(URLContext *s, RTMPContext *rt)
     bytestream_put_be32(&p, rt->stream_id);
     bytestream_put_be32(&p, rt->client_buffer_time);
 
-    return rtmp_send_packet(rt, &pkt, 0);
+    return rtmp_send_packet(rt, &pkt, 0, 1);
 }
 
 /**
@@ -790,7 +793,7 @@ static int gen_play(URLContext *s, RTMPContext *rt)
     ff_amf_write_string(&p, rt->playpath);
     ff_amf_write_number(&p, rt->live * 1000);
 
-    return rtmp_send_packet(rt, &pkt, 1);
+    return rtmp_send_packet(rt, &pkt, 1, 1);
 }
 
 static int gen_seek(URLContext *s, RTMPContext *rt, int64_t timestamp)
@@ -813,7 +816,7 @@ static int gen_seek(URLContext *s, RTMPContext *rt, int64_t timestamp)
     ff_amf_write_null(&p); //as usual, the first null param
     ff_amf_write_number(&p, timestamp); //where we want to jump
 
-    return rtmp_send_packet(rt, &pkt, 1);
+    return rtmp_send_packet(rt, &pkt, 1, 1);
 }
 
 /**
@@ -840,7 +843,7 @@ static int gen_pause(URLContext *s, RTMPContext *rt, int pause, uint32_t timesta
     ff_amf_write_bool(&p, pause); // pause or unpause
     ff_amf_write_number(&p, timestamp); //where we pause the stream
 
-    return rtmp_send_packet(rt, &pkt, 1);
+    return rtmp_send_packet(rt, &pkt, 1, 1);
 }
 
 /**
@@ -867,7 +870,7 @@ static int gen_publish(URLContext *s, RTMPContext *rt)
     ff_amf_write_string(&p, rt->playpath);
     ff_amf_write_string(&p, "live");
 
-    return rtmp_send_packet(rt, &pkt, 1);
+    return rtmp_send_packet(rt, &pkt, 1, 1);
 }
 
 /**
@@ -893,7 +896,7 @@ static int gen_pong(URLContext *s, RTMPContext *rt, RTMPPacket *ppkt)
     bytestream_put_be16(&p, 7); // PingResponse
     bytestream_put_be32(&p, AV_RB32(ppkt->data+2));
 
-    return rtmp_send_packet(rt, &pkt, 0);
+    return rtmp_send_packet(rt, &pkt, 0, 1);
 }
 
 /**
@@ -914,7 +917,7 @@ static int gen_swf_verification(URLContext *s, RTMPContext *rt)
     bytestream_put_be16(&p, 27);
     memcpy(p, rt->swfverification, 42);
 
-    return rtmp_send_packet(rt, &pkt, 0);
+    return rtmp_send_packet(rt, &pkt, 0, 1);
 }
 
 /**
@@ -933,7 +936,7 @@ static int gen_window_ack_size(URLContext *s, RTMPContext *rt)
     p = pkt.data;
     bytestream_put_be32(&p, rt->max_sent_unacked);
 
-    return rtmp_send_packet(rt, &pkt, 0);
+    return rtmp_send_packet(rt, &pkt, 0, 1);
 }
 
 /**
@@ -954,7 +957,7 @@ static int gen_check_bw(URLContext *s, RTMPContext *rt)
     ff_amf_write_number(&p, ++rt->nb_invokes);
     ff_amf_write_null(&p);
 
-    return rtmp_send_packet(rt, &pkt, 1);
+    return rtmp_send_packet(rt, &pkt, 1, 1);
 }
 
 /**
@@ -973,7 +976,7 @@ static int gen_bytes_read(URLContext *s, RTMPContext *rt, uint32_t ts)
     p = pkt.data;
     bytestream_put_be32(&p, rt->bytes_read);
 
-    return rtmp_send_packet(rt, &pkt, 0);
+    return rtmp_send_packet(rt, &pkt, 0, 1);
 }
 
 static int gen_fcsubscribe_stream(URLContext *s, RTMPContext *rt,
@@ -993,7 +996,7 @@ static int gen_fcsubscribe_stream(URLContext *s, RTMPContext *rt,
     ff_amf_write_null(&p);
     ff_amf_write_string(&p, subscribe);
 
-    return rtmp_send_packet(rt, &pkt, 1);
+    return rtmp_send_packet(rt, &pkt, 1, 1);
 }
 
 /**
@@ -2888,7 +2891,8 @@ reconnect:
                 goto fail;
         }
     } else {
-        if (rt->do_reconnect_on_idr <= 0) {
+        // Do not clean buffers if it is a forced reconnection
+        if (rt->force_reconnection_now <= 0) {
             rt->flv_size = 0;
             rt->flv_data = NULL;
             rt->flv_off  = 0;
@@ -2984,7 +2988,7 @@ static int rtmp_reconnect(URLContext *s) {
     int i;
 
     // Close current RTMP connection
-    av_log(s, AV_LOG_INFO, "JOC REOPENING CONNECTION\n");
+    av_log(s, AV_LOG_INFO, "JOC RECONNECTING!\n");
 
     ffurl_closep(&rt->stream);
     rt->do_reconnect = 0;
@@ -3180,72 +3184,67 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
                 }
             }
 
-            //TODO: Set the reconnection, we need to remove
-            if (rt->out_pkt.timestamp > 15000 && !rt->done_reconnect_on_idr) {
-                rt->do_reconnect_on_idr++;
+            // Check if a reconnection is required
+            // Per interval
+            if ((rt->reconnect_interval > 0) && (rt->out_pkt.timestamp >= (rt->last_reconnect_timestamp + rt->reconnect_interval * 1000))) {
+                rt->last_reconnect_timestamp = rt->out_pkt.timestamp;
+                rt->force_reconnection_now = 1;
             }
 
             if (rtmp_packet_is_avc_video_header(&rt->out_pkt)) {
                 // Save last video header
                 if (rt->last_avc_seq_header_pkt.size) {
-                    av_log(s, AV_LOG_INFO, "JOC destroying last video header packet saved\n");
-
-                    // Destroy
+                    av_log(s, AV_LOG_DEBUG, "JOC destroying last video header packet saved\n");
                     ff_rtmp_packet_destroy(&rt->last_avc_seq_header_pkt);
                 }
                 // Save AVC seq header packet
                 if ((ret = ff_rtmp_packet_clone(&rt->last_avc_seq_header_pkt, &rt->out_pkt)) < 0) {
                     return ret;
                 }
-                av_log(s, AV_LOG_INFO, "JOC saved video header packet\n");
+                av_log(s, AV_LOG_DEBUG, "JOC saved video header packet\n");
             }
             else if (rtmp_packet_is_aac_audio_header(&rt->out_pkt)) {
                 // Save last audio header
                 if (rt->last_aac_seq_header_pkt.size) {
-                    av_log(s, AV_LOG_INFO, "JOC destroying last audio header packet saved\n");
-
-                    // Destroy
+                    av_log(s, AV_LOG_DEBUG, "JOC destroying last audio header packet saved\n");
                     ff_rtmp_packet_destroy(&rt->last_aac_seq_header_pkt);
                 }
                 // Save AAC seq header packet
                 if ((ret = ff_rtmp_packet_clone(&rt->last_aac_seq_header_pkt, &rt->out_pkt)) < 0) {
                     return ret;
                 }
-                av_log(s, AV_LOG_INFO, "JOC saved audio header packet\n");
+                av_log(s, AV_LOG_DEBUG, "JOC saved audio header packet\n");
             } 
             else if (rtmp_packet_is_onMetadata_packet(&rt->out_pkt)) {
                 // Save last onMetadata packet
                 if (rt->last_metadata_pkt.size) {
-                    av_log(s, AV_LOG_INFO, "JOC destroying last onMetadata packet saved\n");
-
-                    // Destroy
+                    av_log(s, AV_LOG_DEBUG, "JOC destroying last onMetadata packet saved\n");
                     ff_rtmp_packet_destroy(&rt->last_metadata_pkt);
                 }
                 // Save onMetadata packet
                 if ((ret = ff_rtmp_packet_clone(&rt->last_metadata_pkt, &rt->out_pkt)) < 0) {
                     return ret;
                 }
-                av_log(s, AV_LOG_INFO, "JOC saved onMetadata packet\n");
+                av_log(s, AV_LOG_DEBUG, "JOC saved onMetadata packet\n");
             }
 
             // Reconnection has been requested
-            if (rt->do_reconnect_on_idr >= 1 && !rt->done_reconnect_on_idr && rt->state == STATE_PUBLISHING) {
+            if (rt->force_reconnection_now >= 1) {
                 // Check if packet is video IDR
                 is_idr = rtmp_packet_is_video_avc_IDR(&rt->out_pkt);
-                if (is_idr)
-                    av_log(s, AV_LOG_INFO, "JOC is AVC IDR. has_video: %d, has_audio: %d\n", rt->has_video, rt->has_audio);
+                av_log(s, AV_LOG_DEBUG, "JOC is IDR: %d, has_video: %d, has_audio: %d, state: %d, last_avc_seq_header_pkt.size: %d, last_aac_seq_header_pkt.size: %d\n", is_idr, rt->has_video, rt->has_audio, rt->state, rt->last_avc_seq_header_pkt.size, rt->last_aac_seq_header_pkt.size);
 
-                if (rt->has_video && rt->has_audio) {
+                if (rt->has_video && rt->has_audio && (rt->state == STATE_PUBLISHING)) {
                     // If we only video let's do the reconnection in an IDR frame when we have both headers saved
                     if (is_idr && rt->last_avc_seq_header_pkt.size && rt->last_aac_seq_header_pkt.size)
                         execute_reconnection = 1;
                 }
-                else if (rt->has_video && !rt->has_audio) {
+                else if (rt->has_video && !rt->has_audio && (rt->state == STATE_PUBLISHING)) {
                     // If we have video and NO audio let's do the reconnection in an IDR frame when we have video header saved
                     if (is_idr && rt->last_avc_seq_header_pkt.size)
                         execute_reconnection = 1;
                 }
-                else if (!rt->has_video && rt->has_audio) {
+                else if (!rt->has_video && rt->has_audio & (rt->state == STATE_PUBLISHING)) {
                     // If we have only audio let's do the reconnection when we have the audio header saved
                     if (rt->last_aac_seq_header_pkt.size)
                         execute_reconnection = 1;
@@ -3258,36 +3257,37 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
             if (execute_reconnection) {
                 execute_reconnection = 0;
 
-                av_log(s, AV_LOG_INFO, "JOC PRE RECONNECT rt->flv_off: %d, rt->flv_size: %d\n", rt->flv_off, rt->flv_size);
+                av_log(s, AV_LOG_DEBUG, "JOC RECONNECTING. RTMP packet buffer info rt->flv_off: %d, rt->flv_size: %d\n", rt->flv_off, rt->flv_size);
 
                 if ((ret = rtmp_reconnect(s)) < 0)
                     return ret;
 
-                rt->done_reconnect_on_idr = 1;
+                // Reconnect executed, clear the flag
+                rt->force_reconnection_now = 0;
 
-                av_log(s, AV_LOG_INFO, "JOC POST RECONNECT rt->flv_off: %d, rt->flv_size: %d\n", rt->flv_off, rt->flv_size);
+                av_log(s, AV_LOG_DEBUG, "JOC RECONNECTED RTMP 1st packet sent buffer info rt->flv_off: %d, rt->flv_size: %d\n", rt->flv_off, rt->flv_size);
 
                 // Send last video header if it is saved
                 if (rt->last_avc_seq_header_pkt.size) {
-                    av_log(s, AV_LOG_INFO, "JOC SENDING last video header\n");
+                    av_log(s, AV_LOG_DEBUG, "JOC SENDING last video header\n");
                     rt->last_avc_seq_header_pkt.timestamp = rt->out_pkt.timestamp;
-                    if ((ret = rtmp_send_packet(rt, &rt->last_avc_seq_header_pkt, 0)) < 0)
+                    if ((ret = rtmp_send_packet(rt, &rt->last_avc_seq_header_pkt, 0, 0)) < 0)
                         return ret;
                 }
                 
                 // Send last audio header if it is saved
                 if (rt->last_aac_seq_header_pkt.size) {
-                    av_log(s, AV_LOG_INFO, "JOC SENDING last audio header\n");
+                    av_log(s, AV_LOG_DEBUG, "JOC SENDING last audio header\n");
                     rt->last_aac_seq_header_pkt.timestamp = rt->out_pkt.timestamp;
-                    if ((ret = rtmp_send_packet(rt, &rt->last_aac_seq_header_pkt, 0)) < 0)
+                    if ((ret = rtmp_send_packet(rt, &rt->last_aac_seq_header_pkt, 0, 0)) < 0)
                         return ret;
                 }
 
                 // Send last onMetadata packet, optional
                 if (rt->last_metadata_pkt.size) {
-                    av_log(s, AV_LOG_INFO, "JOC SENDING last onMetadata header\n");
+                    av_log(s, AV_LOG_DEBUG, "JOC SENDING last onMetadata header\n");
                     rt->last_metadata_pkt.timestamp = rt->out_pkt.timestamp;
-                    if ((ret = rtmp_send_packet(rt, &rt->last_metadata_pkt, 0)) < 0)
+                    if ((ret = rtmp_send_packet(rt, &rt->last_metadata_pkt, 0, 0)) < 0)
                         return ret;
                 }
             }
@@ -3296,7 +3296,7 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
             // av_log(s, AV_LOG_INFO, "JOC SENDING rtmp_send_packet, type: %d, size: %d, ts: %d\n", rt->out_pkt.type, rt->out_pkt.size, rt->out_pkt.timestamp);
 
             // Send actual packet
-            if ((ret = rtmp_send_packet(rt, &rt->out_pkt, 0)) < 0)
+            if ((ret = rtmp_send_packet(rt, &rt->out_pkt, 0, 1)) < 0)
                 return ret;
             rt->flv_size = 0;
             rt->flv_off = 0;
@@ -3367,6 +3367,7 @@ static const AVOption rtmp_options[] = {
     {"listen",      "Listen for incoming rtmp connections", OFFSET(listen), AV_OPT_TYPE_INT, {.i64 = 0}, INT_MIN, INT_MAX, DEC, "rtmp_listen" },
     {"tcp_nodelay", "Use TCP_NODELAY to disable Nagle's algorithm", OFFSET(tcp_nodelay), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, DEC|ENC},
     {"timeout", "Maximum timeout (in seconds) to wait for incoming connections. -1 is infinite. Implies -rtmp_listen 1",  OFFSET(listen_timeout), AV_OPT_TYPE_INT, {.i64 = -1}, INT_MIN, INT_MAX, DEC, "rtmp_listen" },
+    {"rtmp_reconnect_time", "Interval (in seconds) to force a client reconnection, it is based on media time. By default is 0 (no reconnection)", OFFSET(reconnect_interval), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, ENC },
     { NULL },
 };
 
