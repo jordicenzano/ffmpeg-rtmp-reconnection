@@ -3204,22 +3204,26 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
 
             // Check if a reconnection is required
             // Per interval
-            if ((rt->reconnect_interval > 0) && (rt->out_pkt.timestamp >= (rt->last_reconnect_timestamp + rt->reconnect_interval * 1000))) {
+            if ((rt->reconnect_interval > 0) &&
+                (rt->out_pkt.timestamp >= (rt->last_reconnect_timestamp + rt->reconnect_interval * 1000))) {
                 rt->last_reconnect_timestamp = rt->out_pkt.timestamp;
                 rt->force_reconnection_now = 1;
-                av_log(s, AV_LOG_TRACE, "trigered internal interval reconnection\n");
+                av_log(s, AV_LOG_TRACE,
+                       "trigered internal interval reconnection\n");
             }
             // Per go away signal
             if (rt->go_away_received > 0) {
                 rt->go_away_received = 0;
                 rt->force_reconnection_now = 1;
-                av_log(s, AV_LOG_TRACE, "detected go away signal from the peer\n");
+                av_log(s, AV_LOG_TRACE,
+                       "detected go away signal from the peer\n");
             }
 
             if (rtmp_packet_is_avc_video_header(&rt->out_pkt)) {
                 // Save last video header
                 if (rt->last_avc_seq_header_pkt.size) {
-                    av_log(s, AV_LOG_DEBUG, "freeing last video header packet saved\n");
+                    av_log(s, AV_LOG_DEBUG,
+                           "freeing last video header packet saved\n");
                     ff_rtmp_packet_destroy(&rt->last_avc_seq_header_pkt);
                 }
                 // Save AVC seq header packet
@@ -3227,11 +3231,11 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
                     return ret;
                 }
                 av_log(s, AV_LOG_DEBUG, "saved video header packet\n");
-            }
-            else if (rtmp_packet_is_aac_audio_header(&rt->out_pkt)) {
+            } else if (rtmp_packet_is_aac_audio_header(&rt->out_pkt)) {
                 // Save last audio header
                 if (rt->last_aac_seq_header_pkt.size) {
-                    av_log(s, AV_LOG_DEBUG, "freeing last audio header packet saved\n");
+                    av_log(s, AV_LOG_DEBUG,
+                           "freeing last audio header packet saved\n");
                     ff_rtmp_packet_destroy(&rt->last_aac_seq_header_pkt);
                 }
                 // Save AAC seq header packet
@@ -3239,11 +3243,11 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
                     return ret;
                 }
                 av_log(s, AV_LOG_DEBUG, "saved audio header packet\n");
-            } 
-            else if (rtmp_packet_is_onMetadata_packet(&rt->out_pkt)) {
+            } else if (rtmp_packet_is_onMetadata_packet(&rt->out_pkt)) {
                 // Save last onMetadata packet
                 if (rt->last_metadata_pkt.size) {
-                    av_log(s, AV_LOG_DEBUG, "freeing last onMetadata packet saved\n");
+                    av_log(s, AV_LOG_DEBUG,
+                           "freeing last onMetadata packet saved\n");
                     ff_rtmp_packet_destroy(&rt->last_metadata_pkt);
                 }
                 // Save onMetadata packet
@@ -3257,32 +3261,50 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
             if (rt->force_reconnection_now >= 1) {
                 // Check if packet is video IDR
                 is_idr = rtmp_packet_is_video_avc_IDR(&rt->out_pkt);
-                av_log(s, AV_LOG_DEBUG, "looking for the right disconnect point. Is IDR: %d, has_video: %d, has_audio: %d, state: %d, last_avc_seq_header_pkt.size: %d, last_aac_seq_header_pkt.size: %d\n", is_idr, rt->has_video, rt->has_audio, rt->state, rt->last_avc_seq_header_pkt.size, rt->last_aac_seq_header_pkt.size);
+                av_log(s, AV_LOG_DEBUG,
+                       "looking for the right disconnect point. Is IDR: %d, "
+                       "has_video: %d, has_audio: %d, state: %d, "
+                       "last_avc_seq_header_pkt.size: %d, "
+                       "last_aac_seq_header_pkt.size: %d\n",
+                       is_idr, rt->has_video, rt->has_audio, rt->state,
+                       rt->last_avc_seq_header_pkt.size,
+                       rt->last_aac_seq_header_pkt.size);
 
-                if (rt->has_video && rt->has_audio && (rt->state == STATE_PUBLISHING)) {
-                    // If we only video let's do the reconnection in an IDR frame when we have both headers saved
-                    if (is_idr && rt->last_avc_seq_header_pkt.size && rt->last_aac_seq_header_pkt.size)
+                if (rt->has_video && rt->has_audio &&
+                    (rt->state == STATE_PUBLISHING)) {
+                    // If we only video let's do the reconnection in an IDR
+                    // frame when we have both headers saved
+                    if (is_idr && rt->last_avc_seq_header_pkt.size &&
+                        rt->last_aac_seq_header_pkt.size)
                         execute_reconnection = 1;
-                }
-                else if (rt->has_video && !rt->has_audio && (rt->state == STATE_PUBLISHING)) {
-                    // If we have video and NO audio let's do the reconnection in an IDR frame when we have video header saved
+                } else if (rt->has_video && !rt->has_audio &&
+                           (rt->state == STATE_PUBLISHING)) {
+                    // If we have video and NO audio let's do the reconnection
+                    // in an IDR frame when we have video header saved
                     if (is_idr && rt->last_avc_seq_header_pkt.size)
                         execute_reconnection = 1;
-                }
-                else if (!rt->has_video && rt->has_audio & (rt->state == STATE_PUBLISHING)) {
-                    // If we have only audio let's do the reconnection when we have the audio header saved
+                } else if (!rt->has_video &&
+                           rt->has_audio & (rt->state == STATE_PUBLISHING)) {
+                    // If we have only audio let's do the reconnection when we
+                    // have the audio header saved
                     if (rt->last_aac_seq_header_pkt.size)
                         execute_reconnection = 1;
-                }
-                else {
-                    av_log(s, AV_LOG_DEBUG, "reconnection is requested but can NOT be executed now, waiting! rt->state: %d, has_video: %d, has_audio: %d, is_idr: %d\n", rt->state, rt->has_video, rt->has_audio, is_idr);
+                } else {
+                    av_log(s, AV_LOG_DEBUG,
+                           "reconnection is requested but can NOT be executed "
+                           "now, waiting! rt->state: %d, has_video: %d, "
+                           "has_audio: %d, is_idr: %d\n",
+                           rt->state, rt->has_video, rt->has_audio, is_idr);
                 }
             }
 
             if (execute_reconnection) {
                 execute_reconnection = 0;
 
-                av_log(s, AV_LOG_DEBUG, "executing reconnection. rt->flv_off: %d, rt->flv_size: %d\n", rt->flv_off, rt->flv_size);
+                av_log(s, AV_LOG_DEBUG,
+                       "executing reconnection. rt->flv_off: %d, rt->flv_size: "
+                       "%d\n",
+                       rt->flv_off, rt->flv_size);
 
                 if ((ret = rtmp_reconnect(s)) < 0)
                     return ret;
@@ -3290,29 +3312,39 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
                 // Reconnect executed, clear the flag
                 rt->force_reconnection_now = 0;
 
-                av_log(s, AV_LOG_DEBUG, "reconnected. rt->flv_off: %d, rt->flv_size: %d\n", rt->flv_off, rt->flv_size);
+                av_log(s, AV_LOG_DEBUG,
+                       "reconnected. rt->flv_off: %d, rt->flv_size: %d\n",
+                       rt->flv_off, rt->flv_size);
 
                 // Send last video header if it is saved
                 if (rt->last_avc_seq_header_pkt.size) {
-                    av_log(s, AV_LOG_DEBUG, "sending last saved video header\n");
-                    rt->last_avc_seq_header_pkt.timestamp = rt->out_pkt.timestamp;
-                    if ((ret = rtmp_send_packet(rt, &rt->last_avc_seq_header_pkt, 0, 0)) < 0)
+                    av_log(s, AV_LOG_DEBUG,
+                           "sending last saved video header\n");
+                    rt->last_avc_seq_header_pkt.timestamp =
+                        rt->out_pkt.timestamp;
+                    if ((ret = rtmp_send_packet(
+                             rt, &rt->last_avc_seq_header_pkt, 0, 0)) < 0)
                         return ret;
                 }
-                
+
                 // Send last audio header if it is saved
                 if (rt->last_aac_seq_header_pkt.size) {
-                    av_log(s, AV_LOG_DEBUG, "sending last saved audio header\n");
-                    rt->last_aac_seq_header_pkt.timestamp = rt->out_pkt.timestamp;
-                    if ((ret = rtmp_send_packet(rt, &rt->last_aac_seq_header_pkt, 0, 0)) < 0)
+                    av_log(s, AV_LOG_DEBUG,
+                           "sending last saved audio header\n");
+                    rt->last_aac_seq_header_pkt.timestamp =
+                        rt->out_pkt.timestamp;
+                    if ((ret = rtmp_send_packet(
+                             rt, &rt->last_aac_seq_header_pkt, 0, 0)) < 0)
                         return ret;
                 }
 
                 // Send last onMetadata packet, optional
                 if (rt->last_metadata_pkt.size) {
-                    av_log(s, AV_LOG_DEBUG, "sending last saved onMetadata header\n");
+                    av_log(s, AV_LOG_DEBUG,
+                           "sending last saved onMetadata header\n");
                     rt->last_metadata_pkt.timestamp = rt->out_pkt.timestamp;
-                    if ((ret = rtmp_send_packet(rt, &rt->last_metadata_pkt, 0, 0)) < 0)
+                    if ((ret = rtmp_send_packet(rt, &rt->last_metadata_pkt, 0,
+                                                0)) < 0)
                         return ret;
                 }
             }
