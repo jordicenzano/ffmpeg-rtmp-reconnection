@@ -59,6 +59,7 @@ typedef enum RTMPPacketType {
     RTMP_PT_SHARED_OBJ,         ///< shared object
     RTMP_PT_INVOKE,             ///< invoke some stream action
     RTMP_PT_METADATA     = 22,  ///< FLV metadata
+    RTMP_PT_GO_AWAY      = 32,  ///< Indicates please reconnect ASAP, server is about to go down
 } RTMPPacketType;
 
 /**
@@ -98,6 +99,15 @@ typedef struct RTMPPacket {
  */
 int ff_rtmp_packet_create(RTMPPacket *pkt, int channel_id, RTMPPacketType type,
                           int timestamp, int size);
+
+/**
+ * Clone RTMP packet
+ *
+ * @param pkt_dst packet destination
+ * @param pkt_src packet source
+ * @return zero on success, negative value otherwise
+ */
+int ff_rtmp_packet_clone(RTMPPacket *pkt_dst, const RTMPPacket *pkt_src);
 
 /**
  * Free RTMP packet.
