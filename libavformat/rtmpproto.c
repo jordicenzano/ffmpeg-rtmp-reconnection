@@ -349,7 +349,7 @@ static int gen_connect(URLContext *s, RTMPContext *rt)
         ff_amf_write_field_name(&p, "type");
         ff_amf_write_string(&p, "nonprivate");
         // Indicates accepts goaway
-        ff_amf_write_field_name(&p, "goaway");
+        ff_amf_write_field_name(&p, "supportsGoAway");
         ff_amf_write_bool(&p, 1);
     }
     ff_amf_write_field_name(&p, "flashVer");
